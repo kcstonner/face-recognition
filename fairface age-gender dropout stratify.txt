@@ -1,11 +1,6 @@
 FAIRFACE AGE subset stratify dropout
 
 
-
-# !pip install -U datasets huggingface-hub fsspec
-
- 
-
 from IPython import get_ipython
 from IPython.display import display
 from transformers import ViTImageProcessor, ViTForImageClassification, TrainingArguments, Trainer, EarlyStoppingCallback
@@ -502,3 +497,4 @@ plt.savefig(f"{output_dir}/loss_curves_combined.png")
 plt.show()
 
 print(f"Loss curves (per step, per epoch, combined) and training time saved in {output_dir}")
+
