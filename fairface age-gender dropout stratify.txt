@@ -1,0 +1,504 @@
+FAIRFACE AGE subset stratify dropout
+
+
+
+# !pip install -U datasets huggingface-hub fsspec
+
+ 
+
+from IPython import get_ipython
+from IPython.display import display
+from transformers import ViTImageProcessor, ViTForImageClassification, TrainingArguments, Trainer, EarlyStoppingCallback
+from datasets import load_dataset
+import torch
+import numpy as np
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+import os
+import random
+import time
+import matplotlib.pyplot as plt
+import seaborn as sns
+import json
+
+# 0. Fixed seed για αναπαραγωγιμότητα
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+# 1. Φόρτωση FairFace dataset (για age classification)
+dataset = load_dataset("HuggingFaceM4/FairFace", "0.25")
+
+# 2. Stratified sample 30,000 δείγματα (όπως UTK-Face) με βάση το age
+# ΑΛΛΑΓΗ: Από ΟΛΟ το FairFace train split, παίρνουμε 20.000 δείγματα stratified ως προς age
+sampled_ds = dataset["train"].train_test_split(
+    train_size=30000,
+    stratify_by_column="age",
+    seed=SEED
+)["train"]
+
+# 3. Split σε train/validation (80%/20%)
+split_ds = sampled_ds.train_test_split(test_size=0.2, seed=SEED)
+train_ds = split_ds["train"]
+val_ds = split_ds["test"]
+
+print("Train/Validation samples:", len(train_ds), len(val_ds))  # αναμένεται ~16000/4000
+
+
+
+
+
+# 2. Ορισμός age bins και labels σύμφωνα με το dataset FairFace
+AGE_GROUP_LABELS = [
+    "0-2", "3-9", "10-19", "20-29", "30-39", "40-49", "50-59", "60-69", "70+"
+]
+num_labels = len(AGE_GROUP_LABELS)
+
+# 3. Προετοιμασία επεξεργαστή εικόνας (φόρτωσε τον processor από το αποθηκευμένο checkpoint σου)
+processor = ViTImageProcessor.from_pretrained("/content/drive/MyDrive/MOUNTEST/GoogleBASEplotsrun5_AGE")
+
+# 4. Προεπεξεργασία δεδομένων (για age)
+def transform(example_batch):
+    images = example_batch['image']
+    labels = example_batch['age']
+    label_map = {name: i for i, name in enumerate(AGE_GROUP_LABELS)}
+    label_ids = [label_map[l] if isinstance(l, str) else int(l) for l in labels]
+    inputs = processor(images)  # επιστρέφει dict of lists (όχι tensors)
+    inputs['labels'] = label_ids
+    return inputs
+
+##prepared_ds = dataset.with_transform(transform)
+#split_ds = prepared_ds["train"].train_test_split(test_size=0.2, seed=SEED)
+#train_ds = split_ds["train"]
+#val_ds = split_ds["test"]
+
+# ΧΡΗΣΙΜΟΠΟΙΗΣΕ ΜΟΝΟ το sampled_ds από εδώ και πέρα!
+prepared_ds = sampled_ds.with_transform(transform)
+split_ds = prepared_ds.train_test_split(test_size=0.2, seed=SEED)
+train_ds = split_ds["train"]
+val_ds = split_ds["test"]
+
+
+# 5. Φόρτωση αποθηκευμένου (προεκπαιδευμένου/προηγούμενα fine-tuned) μοντέλου
+model = ViTForImageClassification.from_pretrained(
+    "/content/drive/MyDrive/MOUNTEST/GoogleBASEplotsrun5_AGE",
+    num_labels=num_labels,
+    id2label={str(i): l for i, l in enumerate(AGE_GROUP_LABELS)},
+    label2id={l: str(i) for i, l in enumerate(AGE_GROUP_LABELS)},
+    ignore_mismatched_sizes=True,
+    hidden_dropout_prob=0.2,   # Προσθήκη ή αλλαγή τιμής dropout
+    attention_probs_dropout_prob=0.2
+)
+
+# 6. Ορισμός μετρικής αξιολόγησης
+def compute_metrics(p):
+    preds = np.argmax(p.predictions, axis=1)
+    labels = p.label_ids
+    acc = accuracy_score(labels, preds)
+    precision = precision_score(labels, preds, average="weighted", zero_division=0)
+    recall = recall_score(labels, preds, average="weighted", zero_division=0)
+    f1 = f1_score(labels, preds, average="weighted", zero_division=0)
+    conf_mat = confusion_matrix(labels, preds)
+    return {
+        'accuracy': acc,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'confusion_matrix': conf_mat.tolist()
+    }
+
+# 7. TrainingArguments
+output_dir = "/content/drive/MyDrive/MOUNTEST/GoogleBASEplotsrun5_FAIRFACE_AGE"
+os.makedirs(output_dir, exist_ok=True)
+
+training_args = TrainingArguments(
+    output_dir=output_dir,
+    per_device_train_batch_size=64,
+    eval_strategy="steps",
+    eval_steps=100,
+    save_steps=100,
+    logging_steps=200,
+    learning_rate=5e-5,
+    num_train_epochs=5,
+    save_total_limit=1,
+    remove_unused_columns=False,
+    push_to_hub=False,
+    report_to='tensorboard',
+    logging_dir=f"{output_dir}/logs",
+    load_best_model_at_end=True,
+    seed=SEED,
+    metric_for_best_model="eval_loss",
+    dataloader_num_workers=2,
+)
+
+# 8. Trainer με EarlyStoppingCallback
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_ds,
+    eval_dataset=val_ds,
+    compute_metrics=compute_metrics,
+   callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
+)
+
+# 9. Fine-tuning με μέτρηση χρόνου
+start_time = time.time()
+train_results = trainer.train()
+end_time = time.time()
+training_time = end_time - start_time
+print(f"Training time (seconds): {training_time:.2f}")
+
+with open(f"{output_dir}/training_time.txt", "w") as f:
+    f.write(str(training_time))
+
+# 10. Αποθήκευση μοντέλου & processor
+trainer.save_model(output_dir)
+processor.save_pretrained(output_dir)
+
+# 11. Αξιολόγηση στο validation set
+eval_results = trainer.evaluate(val_ds)
+print(f"Αποτελέσματα αξιολόγησης στο validation set: {eval_results}")
+
+with open(f"{output_dir}/final_eval_results.json", "w") as f:
+    json.dump(eval_results, f, indent=2)
+
+# 12. Μέγεθος μοντέλου (σε MB)
+def get_model_size(model):
+    params = sum(p.numel() for p in model.parameters())
+    size_mb = params * 4 / (1024 ** 2)
+    return size_mb
+
+print(f"Model size (MB): {get_model_size(model):.2f}")
+
+# 13. Confusion Matrix plot
+if "eval_confusion_matrix" in eval_results:
+    conf_mat = eval_results["eval_confusion_matrix"]
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(conf_mat, annot=True, fmt='d', cmap='Blues',
+                xticklabels=AGE_GROUP_LABELS, yticklabels=AGE_GROUP_LABELS)
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title('Confusion Matrix')
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/confusion_matrix.png")
+    plt.show()
+
+# 14. Loss curves: Extract from Trainer log_history, save as arrays & image
+history = trainer.state.log_history
+train_loss = [x['loss'] for x in history if 'loss' in x]
+eval_loss = [x['eval_loss'] for x in history if 'eval_loss' in x]
+
+np.save(f"{output_dir}/train_losses.npy", np.array(train_loss))
+np.save(f"{output_dir}/eval_losses.npy", np.array(eval_loss))
+
+plt.figure()
+plt.plot(train_loss, label='Train Loss (per step)')
+plt.plot(eval_loss, label='Eval Loss (per step)')
+plt.xlabel('Step')
+plt.ylabel('Loss')
+plt.title('Training/Validation Loss Curves (per step)')
+plt.legend()
+plt.tight_layout()
+plt.savefig(f"{output_dir}/loss_curves.png")
+plt.show()
+
+# Loss curves ανά epoch
+epochs = []
+train_loss_epoch = []
+eval_loss_epoch = []
+
+for entry in history:
+    if 'eval_loss' in entry and 'epoch' in entry:
+        eval_loss_epoch.append(entry['eval_loss'])
+        epochs.append(entry['epoch'])
+    if 'loss' in entry and 'epoch' in entry:
+        train_loss_epoch.append(entry['loss'])
+
+np.save(f"{output_dir}/train_losses_epoch.npy", np.array(train_loss_epoch))
+np.save(f"{output_dir}/eval_losses_epoch.npy", np.array(eval_loss_epoch))
+np.save(f"{output_dir}/epochs.npy", np.array(epochs))
+
+plt.figure()
+plt.plot(epochs[:len(train_loss_epoch)], train_loss_epoch, marker='o', label='Train Loss (per epoch)')
+plt.plot(epochs, eval_loss_epoch, marker='o', label='Eval Loss (per epoch)')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Training/Validation Loss per Epoch')
+plt.legend()
+plt.tight_layout()
+plt.savefig(f"{output_dir}/loss_curves_epoch.png")
+plt.show()
+
+# Combined plot steps & epoch
+plt.figure(figsize=(10, 6))
+plt.plot(train_loss, label='Train Loss (per step)', color='blue', alpha=0.4)
+plt.plot(eval_loss, label='Eval Loss (per step)', color='orange', alpha=0.4)
+plt.plot(np.linspace(0, len(train_loss), len(train_loss_epoch)), train_loss_epoch, 
+         marker='o', linestyle='-', color='blue', label='Train Loss (per epoch)')
+plt.plot(np.linspace(0, len(eval_loss), len(eval_loss_epoch)), eval_loss_epoch, 
+         marker='o', linestyle='-', color='orange', label='Eval Loss (per epoch)')
+plt.xlabel('Step (for step curves) / Epoch (for epoch curves)')
+plt.ylabel('Loss')
+plt.title('Training/Validation Loss (Steps & Epochs)')
+plt.legend()
+plt.tight_layout()
+plt.savefig(f"{output_dir}/loss_curves_combined.png")
+plt.show()
+
+print(f"Loss curves (per step, per epoch, combined) and training time saved in {output_dir}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+GENDER
+# !pip install -U datasets huggingface-hub fsspec
+
+from IPython import get_ipython
+from IPython.display import display
+from transformers import ViTImageProcessor, ViTForImageClassification, TrainingArguments, Trainer, EarlyStoppingCallback
+from datasets import load_dataset
+import torch
+import numpy as np
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+import os
+import random
+import time
+import matplotlib.pyplot as plt
+import seaborn as sns
+import json
+
+# 0. Fixed seed για αναπαραγωγιμότητα
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+# 1. Φόρτωση FairFace dataset (για gender classification)
+dataset = load_dataset("HuggingFaceM4/FairFace", "0.25")
+
+# 2. Stratified sample 30,000 δείγματα με βάση το gender
+sampled_ds = dataset["train"].train_test_split(
+    train_size=30000,
+    stratify_by_column="gender",
+    seed=SEED
+)["train"]
+
+# 3. Split σε train/validation (80%/20%)
+split_ds = sampled_ds.train_test_split(test_size=0.2, seed=SEED)
+train_ds = split_ds["train"]
+val_ds = split_ds["test"]
+
+print("Train/Validation samples:", len(train_ds), len(val_ds))  # αναμένεται ~24.000/6.000
+
+# 4. Ορισμός gender labels
+GENDER_LABELS = ["Male", "Female"]
+num_labels = len(GENDER_LABELS)
+
+# 5. Προετοιμασία επεξεργαστή εικόνας (φόρτωσε τον processor από το αποθηκευμένο checkpoint σου)
+processor = ViTImageProcessor.from_pretrained("/content/drive/MyDrive/MOUNTEST/google-base-run5_gender")
+
+# 6. Προεπεξεργασία δεδομένων (για gender)
+def transform(example_batch):
+    images = example_batch['image']
+    labels = example_batch['gender']
+    label_map = {name: i for i, name in enumerate(GENDER_LABELS)}
+    label_ids = [label_map[l] if isinstance(l, str) else int(l) for l in labels]
+    inputs = processor(images)
+    inputs['labels'] = label_ids
+    return inputs
+
+# Χρησιμοποίησε ΜΟΝΟ το sampled_ds από εδώ και πέρα!
+prepared_ds = sampled_ds.with_transform(transform)
+split_ds = prepared_ds.train_test_split(test_size=0.2, seed=SEED)
+train_ds = split_ds["train"]
+val_ds = split_ds["test"]
+
+# 7. Φόρτωση αποθηκευμένου (προεκπαιδευμένου/προηγούμενα fine-tuned) μοντέλου
+model = ViTForImageClassification.from_pretrained(
+    "/content/drive/MyDrive/MOUNTEST/google-base-run5_gender",
+    num_labels=num_labels,
+    id2label={str(i): l for i, l in enumerate(GENDER_LABELS)},
+    label2id={l: str(i) for i, l in enumerate(GENDER_LABELS)},
+    ignore_mismatched_sizes=True,
+    hidden_dropout_prob=0.2,
+    attention_probs_dropout_prob=0.2
+)
+
+# 8. Ορισμός μετρικής αξιολόγησης
+def compute_metrics(p):
+    preds = np.argmax(p.predictions, axis=1)
+    labels = p.label_ids
+    acc = accuracy_score(labels, preds)
+    precision = precision_score(labels, preds, average="weighted", zero_division=0)
+    recall = recall_score(labels, preds, average="weighted", zero_division=0)
+    f1 = f1_score(labels, preds, average="weighted", zero_division=0)
+    conf_mat = confusion_matrix(labels, preds)
+    return {
+        'accuracy': acc,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'confusion_matrix': conf_mat.tolist()
+    }
+
+# 9. TrainingArguments
+output_dir = "/content/drive/MyDrive/MOUNTEST/google-base-run5_gender_FAIRFACE"
+os.makedirs(output_dir, exist_ok=True)
+
+training_args = TrainingArguments(
+    output_dir=output_dir,
+    per_device_train_batch_size=64,
+    eval_strategy="steps",
+    eval_steps=100,
+    save_steps=100,
+    logging_steps=100,
+    learning_rate=5e-5,
+    num_train_epochs=5,
+    save_total_limit=1,
+    remove_unused_columns=False,
+    push_to_hub=False,
+    report_to='tensorboard',
+    logging_dir=f"{output_dir}/logs",
+    load_best_model_at_end=True,
+    seed=SEED,
+    metric_for_best_model="eval_loss",
+    dataloader_num_workers=2,
+)
+
+# 10. Trainer με EarlyStoppingCallback
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_ds,
+    eval_dataset=val_ds,
+    compute_metrics=compute_metrics,
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
+)
+
+# 11. Fine-tuning με μέτρηση χρόνου
+start_time = time.time()
+train_results = trainer.train()
+end_time = time.time()
+training_time = end_time - start_time
+print(f"Training time (seconds): {training_time:.2f}")
+
+with open(f"{output_dir}/training_time.txt", "w") as f:
+    f.write(str(training_time))
+
+# 12. Αποθήκευση μοντέλου & processor
+trainer.save_model(output_dir)
+processor.save_pretrained(output_dir)
+
+# 13. Αξιολόγηση στο validation set
+eval_results = trainer.evaluate(val_ds)
+print(f"Αποτελέσματα αξιολόγησης στο validation set: {eval_results}")
+
+with open(f"{output_dir}/final_eval_results.json", "w") as f:
+    json.dump(eval_results, f, indent=2)
+
+# 14. Μέγεθος μοντέλου (σε MB)
+def get_model_size(model):
+    params = sum(p.numel() for p in model.parameters())
+    size_mb = params * 4 / (1024 ** 2)
+    return size_mb
+
+print(f"Model size (MB): {get_model_size(model):.2f}")
+
+# 15. Confusion Matrix plot
+if "eval_confusion_matrix" in eval_results:
+    conf_mat = eval_results["eval_confusion_matrix"]
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(conf_mat, annot=True, fmt='d', cmap='Blues',
+                xticklabels=GENDER_LABELS, yticklabels=GENDER_LABELS)
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title('Confusion Matrix')
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/confusion_matrix.png")
+    plt.show()
+
+# 16. Loss curves: Extract from Trainer log_history, save as arrays & image
+history = trainer.state.log_history
+train_loss = [x['loss'] for x in history if 'loss' in x]
+eval_loss = [x['eval_loss'] for x in history if 'eval_loss' in x]
+
+np.save(f"{output_dir}/train_losses.npy", np.array(train_loss))
+np.save(f"{output_dir}/eval_losses.npy", np.array(eval_loss))
+
+plt.figure()
+plt.plot(train_loss, label='Train Loss (per step)')
+plt.plot(eval_loss, label='Eval Loss (per step)')
+plt.xlabel('Step')
+plt.ylabel('Loss')
+plt.title('Training/Validation Loss Curves (per step)')
+plt.legend()
+plt.tight_layout()
+plt.savefig(f"{output_dir}/loss_curves.png")
+plt.show()
+
+# Loss curves ανά epoch
+epochs = []
+train_loss_epoch = []
+eval_loss_epoch = []
+
+for entry in history:
+    if 'eval_loss' in entry and 'epoch' in entry:
+        eval_loss_epoch.append(entry['eval_loss'])
+        epochs.append(entry['epoch'])
+    if 'loss' in entry and 'epoch' in entry:
+        train_loss_epoch.append(entry['loss'])
+
+np.save(f"{output_dir}/train_losses_epoch.npy", np.array(train_loss_epoch))
+np.save(f"{output_dir}/eval_losses_epoch.npy", np.array(eval_loss_epoch))
+np.save(f"{output_dir}/epochs.npy", np.array(epochs))
+
+plt.figure()
+plt.plot(epochs[:len(train_loss_epoch)], train_loss_epoch, marker='o', label='Train Loss (per epoch)')
+plt.plot(epochs, eval_loss_epoch, marker='o', label='Eval Loss (per epoch)')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Training/Validation Loss per Epoch')
+plt.legend()
+plt.tight_layout()
+plt.savefig(f"{output_dir}/loss_curves_epoch.png")
+plt.show()
+
+# Combined plot steps & epoch
+plt.figure(figsize=(10, 6))
+plt.plot(train_loss, label='Train Loss (per step)', color='blue', alpha=0.4)
+plt.plot(eval_loss, label='Eval Loss (per step)', color='orange', alpha=0.4)
+plt.plot(np.linspace(0, len(train_loss), len(train_loss_epoch)), train_loss_epoch, 
+         marker='o', linestyle='-', color='blue', label='Train Loss (per epoch)')
+plt.plot(np.linspace(0, len(eval_loss), len(eval_loss_epoch)), eval_loss_epoch, 
+         marker='o', linestyle='-', color='orange', label='Eval Loss (per epoch)')
+plt.xlabel('Step (for step curves) / Epoch (for epoch curves)')
+plt.ylabel('Loss')
+plt.title('Training/Validation Loss (Steps & Epochs)')
+plt.legend()
+plt.tight_layout()
+plt.savefig(f"{output_dir}/loss_curves_combined.png")
+plt.show()
+
+print(f"Loss curves (per step, per epoch, combined) and training time saved in {output_dir}")
